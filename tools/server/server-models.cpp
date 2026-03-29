@@ -694,11 +694,10 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
-void server_models::unload_lru() {
+void server_models::unload_lru(uint64_t new_model_memory_mb) {
     if (base_params.models_max <= 0 && base_params.models_memory_max <= 0) {
         return; // no limit
     }
-    // Keep unloading LRU models until limits are satisfied
     while (true) {
         std::string lru_model_name = "";
         int64_t lru_last_used = ggml_time_ms();
@@ -717,12 +716,14 @@ void server_models::unload_lru() {
                 }
             }
         }
-        // Check if limits exceeded
-        bool count_exceeded = base_params.models_max > 0 && count_active >= (size_t)base_params.models_max;
-        bool memory_exceeded = base_params.models_memory_max > 0 && total_memory_mb >= (uint64_t)base_params.models_memory_max;
+        bool count_exceeded = base_params.models_max > 0 &&
+                              (count_active + 1) >= (size_t)base_params.models_max;
+        uint64_t projected_memory = total_memory_mb + new_model_memory_mb;
+        bool memory_exceeded = base_params.models_memory_max > 0 &&
+                               projected_memory >= (uint64_t)base_params.models_memory_max;
         if (!lru_model_name.empty() && (count_exceeded || memory_exceeded)) {
-            SRV_INF("limits reached (count=%zu, memory=%lu MB), removing LRU name=%s\n",
-                    count_active, (unsigned long)total_memory_mb, lru_model_name.c_str());
+            SRV_INF("limits reached (count=%zu, memory=%lu MB + %lu MB new), removing LRU name=%s\n",
+                    count_active, (unsigned long)total_memory_mb, (unsigned long)new_model_memory_mb, lru_model_name.c_str());
             unload(lru_model_name);
             // wait for unload to complete
             {
@@ -731,9 +732,8 @@ void server_models::unload_lru() {
                     return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
                 });
             }
-            // Loop continues to check if more unloading is needed
         } else {
-            break; // limits satisfied
+            break;
         }
     }
 }
@@ -742,7 +742,26 @@ void server_models::load(const std::string & name) {
     if (!has_model(name)) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
-    unload_lru();
+
+    uint64_t new_model_memory_mb = 0;
+    if (base_params.models_memory_max > 0) {
+        std::string model_path;
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            auto & meta = mapping[name].meta;
+            if (meta.preset.get_option("LLAMA_ARG_MODEL", model_path) && !model_path.empty()) {
+                uint64_t size_bytes = llama_model_size_from_path(model_path.c_str());
+                new_model_memory_mb = size_bytes / (1024 * 1024);
+                meta.memory_mb = new_model_memory_mb;
+                if (new_model_memory_mb > 0) {
+                    SRV_INF("model %s estimated size: %lu MB\n", name.c_str(),
+                            (unsigned long)new_model_memory_mb);
+                }
+            }
+        }
+    }
+
+    unload_lru(new_model_memory_mb);
 
     std::unique_lock<std::mutex> lk(mutex);
     // edge case: block until any in-progress reload has finished so we always load
@@ -834,7 +853,6 @@ void server_models::load(const std::string & name) {
                     LOG("[%5d] %s", port, buffer);
                     std::string str(buffer);
                     if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_READY)) {
-                        // Query memory usage from the child's /props endpoint
                         if (!ready_received) {
                             ready_received = true;
                             try {
@@ -845,8 +863,7 @@ void server_models::load(const std::string & name) {
                                         json props = json::parse(res->body);
                                         if (props.contains("memory_mb")) {
                                             uint64_t memory_mb = props["memory_mb"].get<uint64_t>();
-                                            SRV_INF("model %s loaded, memory usage: %lu MB\n", name.c_str(), (unsigned long)memory_mb);
-                                            // Update memory_mb in meta
+                                            SRV_INF("model %s loaded, actual memory: %lu MB\n", name.c_str(), (unsigned long)memory_mb);
                                             std::lock_guard<std::mutex> lk(this->mutex);
                                             if (mapping.find(name) != mapping.end()) {
                                                 mapping[name].meta.memory_mb = memory_mb;
