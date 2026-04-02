@@ -775,7 +775,7 @@ void server_models::unload_lru(const model_memory_map& new_model_memory_per_devi
             memory_exceeded = get_memory_exceeded(new_model_memory_per_device);
         }
         bool count_exceeded = base_params.models_max > 0 &&
-                              (count_active + 1) >= (size_t)base_params.models_max;
+                              (count_active + 1) > (size_t)base_params.models_max;
 
         if (!lru_model_name.empty() && (count_exceeded || memory_exceeded > 0)) {
             SRV_INF("limits reached (count=%zu, memory margin exceeded on %zu device(s)), removing LRU name=%s\n",
