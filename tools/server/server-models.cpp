@@ -221,17 +221,28 @@ server_models::server_models(
     const size_t memory_margin = (size_t) base_params.models_memory_margin * 1024 * 1024;
 
     if (memory_margin > 0) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_buffer_type_t cpu_buft = cpu_dev ? ggml_backend_dev_buffer_type(cpu_dev) : nullptr;
+
         const size_t n_devs = ggml_backend_dev_count();
         for (size_t i = 0; i < n_devs; i++) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(dev);
+            if (dev_buft) {
+                buft_by_name[ggml_backend_buft_name(dev_buft)] = dev_buft;
+            }
+            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+            if (host_buft && cpu_buft) {
+                buft_by_name[ggml_backend_buft_name(host_buft)] = cpu_buft;
+            }
+
             size_t free, total;
             ggml_backend_dev_memory(dev, &free, &total);
-            if (total > 0) {
-                ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+            if (total > 0 && dev_buft) {
                 const size_t available = (free > memory_margin) ? free - memory_margin : 0;
-                bmm_available[buft] = available;
+                bmm_available[dev_buft] = available;
                 SRV_DBG("buft %s: available memory after margin=%zu MiB\n",
-                    ggml_backend_buft_name(buft), available / (1024 * 1024));
+                    ggml_backend_buft_name(dev_buft), available / (1024 * 1024));
             }
         }
     }
@@ -902,17 +913,9 @@ buft_memory_map server_models::estimate_model_memory(const std::string & name) {
                 std::string buft_name;
                 size_t size = 0;
                 if (iss >> buft_name >> size) {
-                    ggml_backend_buffer_type_t buft = nullptr;
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                        ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(dev);
-                        if (dev_buft && buft_name == ggml_backend_buft_name(dev_buft)) {
-                            buft = dev_buft;
-                            break;
-                        }
-                    }
-                    if (buft) {
-                        result[buft] = size;
+                    auto it = buft_by_name.find(buft_name);
+                    if (it != buft_by_name.end()) {
+                        result[it->second] += size;
                     } else {
                         SRV_WRN("unknown buft name '%s' from measure child for model name=%s\n",
                             buft_name.c_str(), name.c_str());

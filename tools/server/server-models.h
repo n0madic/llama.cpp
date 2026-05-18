@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <set>
+#include <unordered_map>
 
 /**
  * state diagram:
@@ -134,6 +135,9 @@ private:
 
     // available memory per buffer type
     buft_memory_map bmm_available;
+
+    // buft name -> buft lookup (host buffer types map to CPU buft)
+    std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_by_name;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
