@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -588,19 +589,21 @@ std::string tag_of(const std::string & model_id) {
     return {};
 }
 
-// on-disk size of a cached model id (repo:tag): the file(s) `pull` would actually select,
-// resolved by the shared helper in common/download.cpp (quant preference + split shards),
-// so multi-quant repos are not over-counted. Returns 0 if not cached / not a HF repo.
-uint64_t model_size_bytes(const std::string & model_id) {
-    uint64_t total = 0;
-    for (const auto & path : common_cached_model_files(model_id)) {
-        std::error_code ec;
-        const auto sz = fs::file_size(path, ec); // returns -1 and sets ec on failure
-        if (!ec) {
-            total += (uint64_t) sz;
-        }
+// format a unix timestamp (seconds) as a local "YYYY-MM-DD HH:MM"; empty string for 0/unknown
+std::string format_mtime(int64_t unix_seconds) {
+    if (unix_seconds <= 0) {
+        return {};
     }
-    return total;
+    const std::time_t t = (std::time_t) unix_seconds;
+    std::tm tm = {};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[20];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
+    return buf;
 }
 
 std::string format_params(uint64_t n) {
@@ -1251,19 +1254,37 @@ struct model_row {
     std::string name;
     std::string status;
     std::string size;
+    std::string modified; // empty -> the MODIFIED column is omitted
 };
 
-// print NAME / SIZE / STATUS columns with auto-sized name and size widths
+// print NAME / SIZE / [MODIFIED] / STATUS columns with auto-sized widths. The MODIFIED column is
+// shown only when at least one row carries a modified time (e.g. `list`, but not `ps`).
 void print_model_table(const std::vector<model_row> & rows) {
     size_t w_name = 4; // strlen("NAME")
     size_t w_size = 4; // strlen("SIZE")
+    size_t w_mod  = 8; // strlen("MODIFIED")
+    bool   show_mod = false;
     for (const auto & r : rows) {
         w_name = std::max(w_name, r.name.size());
         w_size = std::max(w_size, r.size.size());
+        if (!r.modified.empty()) {
+            show_mod = true;
+            w_mod   = std::max(w_mod, r.modified.size());
+        }
     }
-    printf("%-*s  %-*s  %s\n", (int) w_name, "NAME", (int) w_size, "SIZE", "STATUS");
-    for (const auto & r : rows) {
-        printf("%-*s  %-*s  %s\n", (int) w_name, r.name.c_str(), (int) w_size, r.size.c_str(), r.status.c_str());
+    if (show_mod) {
+        printf("%-*s  %-*s  %-*s  %s\n",
+               (int) w_name, "NAME", (int) w_size, "SIZE", (int) w_mod, "MODIFIED", "STATUS");
+        for (const auto & r : rows) {
+            printf("%-*s  %-*s  %-*s  %s\n",
+                   (int) w_name, r.name.c_str(), (int) w_size, r.size.c_str(),
+                   (int) w_mod, r.modified.c_str(), r.status.c_str());
+        }
+    } else {
+        printf("%-*s  %-*s  %s\n", (int) w_name, "NAME", (int) w_size, "SIZE", "STATUS");
+        for (const auto & r : rows) {
+            printf("%-*s  %-*s  %s\n", (int) w_name, r.name.c_str(), (int) w_size, r.size.c_str(), r.status.c_str());
+        }
     }
 }
 
@@ -1344,18 +1365,19 @@ int cmd_list(int argc, char ** argv) {
     if (daemon_is_router(cfg)) {
         try {
             for (const auto & m : fetch_models(cfg)) {
+                const auto st = common_cached_model_disk_stats(m.size_repo);
                 rows.push_back({m.id, m.status.empty() ? "unloaded" : m.status,
-                                format_size(model_size_bytes(m.size_repo))});
+                                format_size(st.size), format_mtime(st.mtime)});
             }
         } catch (const std::exception & e) {
             fprintf(stderr, "error: %s\n", e.what());
             return 1;
         }
     } else {
-        // offline fallback: enumerate the HF cache directly. Request sizes so they are summed in
-        // the single cache walk, instead of re-resolving each model with a separate cache scan.
-        for (const auto & m : common_list_cached_models(/* with_sizes */ true)) {
-            rows.push_back({m.to_string(), "-", format_size(m.size)});
+        // offline fallback: enumerate the HF cache directly. Request stats so size and mtime are
+        // computed in the single cache walk, instead of re-resolving each model with a separate scan.
+        for (const auto & m : common_list_cached_models(/* with_stats */ true)) {
+            rows.push_back({m.to_string(), "-", format_size(m.size), format_mtime(m.mtime)});
         }
     }
 
@@ -1380,7 +1402,7 @@ int cmd_ps(int argc, char ** argv) {
     try {
         for (const auto & m : fetch_models(cfg)) {
             if (m.status == "loading" || m.status == "loaded" || m.status == "sleeping") {
-                rows.push_back({m.id, m.status, format_size(model_size_bytes(m.size_repo))});
+                rows.push_back({m.id, m.status, format_size(common_cached_model_disk_stats(m.size_repo).size), ""});
             }
         }
     } catch (const std::exception & e) {

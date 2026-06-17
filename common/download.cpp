@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -1039,25 +1040,41 @@ std::string common_docker_resolve_model(const std::string & docker) {
     }
 }
 
-std::vector<common_cached_model_info> common_list_cached_models(bool with_sizes) {
+// convert a filesystem timestamp to unix seconds (file_time_type uses an unspecified clock in C++17)
+static int64_t file_time_to_unix(std::filesystem::file_time_type ft) {
+    const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+    return (int64_t) std::chrono::system_clock::to_time_t(sys);
+}
+
+std::vector<common_cached_model_info> common_list_cached_models(bool with_stats) {
     std::unordered_set<std::string> seen;
     std::vector<common_cached_model_info> result;
 
     auto files = hf_cache::get_cached_files();
 
-    // optionally sum on-disk sizes per (repo, split-prefix) in a single pass, so a model's
-    // primary GGUF + its split shards are aggregated without re-walking the cache per model
+    // optionally aggregate on-disk size and newest mtime per (repo, split-prefix) in a single pass,
+    // so a model's primary GGUF + its split shards are stat'd without re-walking the cache per model
     std::map<std::pair<std::string, std::string>, uint64_t> size_by_group;
-    if (with_sizes) {
+    std::map<std::pair<std::string, std::string>, int64_t>  mtime_by_group;
+    if (with_stats) {
         for (const auto & f : files) {
             auto split = get_gguf_split_info(f.path);
             if (split.prefix.empty()) {
                 continue; // not a GGUF file
             }
+            const std::string & path = f.local_path.empty() ? f.final_path : f.local_path;
+            const auto key = std::make_pair(f.repo_id, split.prefix);
             std::error_code ec;
-            const auto sz = std::filesystem::file_size(f.local_path.empty() ? f.final_path : f.local_path, ec);
+            const auto sz = std::filesystem::file_size(path, ec);
             if (!ec) {
-                size_by_group[{f.repo_id, split.prefix}] += (uint64_t) sz;
+                size_by_group[key] += (uint64_t) sz;
+            }
+            std::error_code ec_t;
+            const auto ft = std::filesystem::last_write_time(path, ec_t);
+            if (!ec_t) {
+                int64_t & cur = mtime_by_group[key];
+                cur = std::max(cur, file_time_to_unix(ft));
             }
         }
     }
@@ -1073,9 +1090,16 @@ std::vector<common_cached_model_info> common_list_cached_models(bool with_sizes)
             common_cached_model_info info;
             info.repo = f.repo_id;
             info.tag  = split.tag;
-            if (with_sizes) {
-                const auto it = size_by_group.find({f.repo_id, split.prefix});
-                info.size = it != size_by_group.end() ? it->second : 0;
+            if (with_stats) {
+                const auto key = std::make_pair(f.repo_id, split.prefix);
+                const auto it_s = size_by_group.find(key);
+                if (it_s != size_by_group.end()) {
+                    info.size = it_s->second;
+                }
+                const auto it_m = mtime_by_group.find(key);
+                if (it_m != mtime_by_group.end()) {
+                    info.mtime = it_m->second;
+                }
             }
             result.push_back(std::move(info));
         }
@@ -1166,4 +1190,21 @@ bool common_download_remove(const std::string & hf_repo_with_tag) {
     }
 
     return true;
+}
+
+common_cached_model_stats common_cached_model_disk_stats(const std::string & hf_repo) {
+    common_cached_model_stats out;
+    for (const auto & path : common_cached_model_files(hf_repo)) {
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(path, ec);
+        if (!ec) {
+            out.size += (uint64_t) sz;
+        }
+        std::error_code ec_t;
+        const auto ft = std::filesystem::last_write_time(path, ec_t);
+        if (!ec_t) {
+            out.mtime = std::max(out.mtime, file_time_to_unix(ft));
+        }
+    }
+    return out;
 }
