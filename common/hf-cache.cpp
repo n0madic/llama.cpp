@@ -409,35 +409,26 @@ hf_files get_cached_files(const std::string & repo_id) {
 
     hf_files files;
 
-    for (const auto & repo : fs::directory_iterator(cache_dir)) {
-        if (!repo.is_directory()) {
-            continue;
-        }
-        fs::path snapshots_path = repo.path() / "snapshots";
-
+    // collect the cached files of a single "models--*" repo directory into `files`
+    auto collect_repo = [&](const fs::path & repo_path) {
+        fs::path snapshots_path = repo_path / "snapshots";
         if (!fs::exists(snapshots_path)) {
-            continue;
+            return;
         }
-        std::string _repo_id = folder_name_to_repo(repo.path().filename().string());
-
+        std::string _repo_id = folder_name_to_repo(repo_path.filename().string());
         if (!is_valid_repo_id(_repo_id)) {
-            continue;
+            return;
         }
-        if (!repo_id.empty() && _repo_id != repo_id) {
-            continue;
-        }
-        std::string commit = get_cached_ref(repo.path());
+        std::string commit = get_cached_ref(repo_path);
         fs::path commit_path = snapshots_path / commit;
-
         if (commit.empty() || !fs::is_directory(commit_path)) {
-            continue;
+            return;
         }
         for (const auto & entry : fs::recursive_directory_iterator(commit_path)) {
             if (!entry.is_regular_file() && !entry.is_symlink()) {
                 continue;
             }
             fs::path path = entry.path().lexically_relative(commit_path);
-
             if (!path.empty()) {
                 hf_file file;
                 file.repo_id = _repo_id;
@@ -445,6 +436,17 @@ hf_files get_cached_files(const std::string & repo_id) {
                 file.local_path = entry.path().string();
                 file.final_path = file.local_path;
                 files.push_back(std::move(file));
+            }
+        }
+    };
+
+    if (!repo_id.empty()) {
+        // resolve the single repo directly instead of scanning the entire cache directory
+        collect_repo(get_repo_path(repo_id));
+    } else {
+        for (const auto & repo : fs::directory_iterator(cache_dir)) {
+            if (repo.is_directory()) {
+                collect_repo(repo.path());
             }
         }
     }
@@ -508,6 +510,88 @@ bool remove_cached_repo(const std::string & repo_id) {
         return false;
     }
     return removed > 0;
+}
+
+bool delete_cached_repo(const std::string & repo_id) {
+    if (!is_valid_repo_id(repo_id)) {
+        LOG_WRN("%s: invalid repository: %s\n", __func__, repo_id.c_str());
+        return false;
+    }
+
+    std::error_code ec;
+    fs::path cache_dir = fs::absolute(get_cache_directory(), ec).lexically_normal();
+    fs::path target    = fs::absolute(get_repo_path(repo_id), ec).lexically_normal();
+
+    // safety: the target must live strictly inside the cache directory. Use lexically_relative
+    // (instead of a component-wise prefix match) so a trailing separator on the cache directory
+    // -- e.g. LLAMA_CACHE=/path/hub/ -- does not break the containment check.
+    const fs::path rel = target.lexically_relative(cache_dir);
+    if (rel.empty() || *rel.begin() == "..") {
+        LOG_WRN("%s: refusing to delete path outside cache: %s\n", __func__, target.string().c_str());
+        return false;
+    }
+
+    // safety: the target must follow the "models--*" naming convention
+    if (target.filename().string().rfind("models--", 0) != 0) {
+        LOG_WRN("%s: refusing to delete non-model path: %s\n", __func__, target.string().c_str());
+        return false;
+    }
+
+    if (!fs::exists(target, ec)) {
+        return false; // nothing to delete
+    }
+
+    const auto removed = fs::remove_all(target, ec);
+    if (ec) {
+        LOG_ERR("%s: failed to delete %s: %s\n", __func__, target.string().c_str(), ec.message().c_str());
+        return false;
+    }
+    return removed > 0;
+}
+
+size_t delete_cached_files(const std::string & repo_id, const std::vector<std::string> & paths) {
+    if (!is_valid_repo_id(repo_id)) {
+        LOG_WRN("%s: invalid repository: %s\n", __func__, repo_id.c_str());
+        return 0;
+    }
+
+    std::error_code ec;
+    const fs::path repo_dir = fs::absolute(get_repo_path(repo_id), ec).lexically_normal();
+
+    // a path is in-bounds only if it stays strictly inside this repo's cache directory
+    auto inside_repo = [&](const fs::path & p) {
+        const fs::path rel = p.lexically_relative(repo_dir);
+        return !rel.empty() && *rel.begin() != "..";
+    };
+
+    size_t removed = 0;
+    for (const auto & raw : paths) {
+        const fs::path snap = fs::absolute(raw, ec).lexically_normal();
+        if (!inside_repo(snap)) {
+            LOG_WRN("%s: refusing to delete path outside repo: %s\n", __func__, snap.string().c_str());
+            continue;
+        }
+
+        // resolve the blob a snapshot symlink points to, before unlinking the symlink
+        fs::path blob;
+        if (fs::is_symlink(snap, ec)) {
+            const fs::path target = fs::read_symlink(snap, ec);
+            if (!ec) {
+                blob = (target.is_absolute() ? target : snap.parent_path() / target).lexically_normal();
+            }
+        }
+
+        if (fs::remove(snap, ec)) {
+            removed++;
+        }
+
+        // remove the referenced blob too, but only a real blob ("<repo>/blobs/<oid>") inside the repo
+        if (!blob.empty() && inside_repo(blob) && blob.parent_path().filename() == "blobs") {
+            fs::remove(blob, ec);                              // the content blob
+            fs::remove(fs::path(blob.string() + ".lock"), ec); // best-effort: its download lock
+        }
+    }
+    return removed;
 }
 
 } // namespace hf_cache

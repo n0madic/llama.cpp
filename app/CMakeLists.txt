@@ -6,6 +6,7 @@ set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME llama)
 target_link_libraries(${TARGET} PRIVATE
     llama-server-impl
     llama-cli-impl
+    llama-cmd
     llama-completion-impl
     llama-bench-impl
     llama-batched-bench-impl

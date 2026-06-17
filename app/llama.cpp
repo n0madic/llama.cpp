@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,16 @@ extern const char * LICENSES[];
 // visible
 int llama_server(int argc, char ** argv);
 int llama_cli(int argc, char ** argv);
+
+// ollama-style model management (tools/cmd)
+int llama_pull(int argc, char ** argv);
+int llama_run(int argc, char ** argv);
+int llama_list(int argc, char ** argv);
+int llama_ps(int argc, char ** argv);
+int llama_stop(int argc, char ** argv);
+int llama_rm(int argc, char ** argv);
+int llama_create(int argc, char ** argv);
+int llama_show(int argc, char ** argv);
 
 // hidden
 int llama_completion(int argc, char ** argv);
@@ -60,6 +71,14 @@ struct command {
 static const command cmds[] = {
     {"serve",         "HTTP API server",                                    {"server"},   false,         llama_server       },
     {"cli",           "Command-line interactive interface",                 {"client"},   false,         llama_cli          },
+    {"pull",          "Download a model from a HuggingFace repo",           {},           false,         llama_pull         },
+    {"run",           "Run a model (chat) via the local daemon",            {},           false,         llama_run          },
+    {"list",          "List downloaded models",                             {"ls"},       false,         llama_list         },
+    {"ps",            "List running models",                                {},           false,         llama_ps           },
+    {"stop",          "Unload a running model",                             {},           false,         llama_stop         },
+    {"rm",            "Remove a model from the cache, or a preset",         {},           false,         llama_rm           },
+    {"create",        "Create a named model preset",                        {},           false,         llama_create       },
+    {"show",          "Show a model preset",                                {},           false,         llama_show         },
     {"update",        "Update llama to the latest release",                 {},           UPDATE_HIDDEN, llama_update       },
     {"completion",    "Text completion",                                    {"complete"}, true,          llama_completion   },
     {"bench",         "Benchmark prompt processing and text generation",    {},           true,          llama_bench        },
@@ -131,7 +150,13 @@ int main(int argc, char ** argv) {
 #else
             setenv("LLAMA_APP_CMD", cmd.name, 1);
 #endif
-            return cmd.func(argc - 1, argv + 1);
+            // top-level guard: a command throwing must not crash via std::terminate
+            try {
+                return cmd.func(argc - 1, argv + 1);
+            } catch (const std::exception & e) {
+                fprintf(stderr, "error: %s\n", e.what());
+                return 1;
+            }
         }
     }
 

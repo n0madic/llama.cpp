@@ -642,6 +642,21 @@ static bool gguf_filename_is_model(const std::string & filepath) {
            filename.find("mtp-")    == std::string::npos;
 }
 
+// escape regex metacharacters so a literal quant tag (e.g. "Q4_K_M") is matched verbatim and a
+// tag that happens to contain regex-special characters can never throw std::regex_error
+static std::string regex_escape_literal(const std::string & s) {
+    static const std::string specials = R"(.^$|()[]{}*+?\)";
+    std::string out;
+    out.reserve(s.size());
+    for (const char c : s) {
+        if (specials.find(c) != std::string::npos) {
+            out += '\\';
+        }
+        out += c;
+    }
+    return out;
+}
+
 static hf_cache::hf_file find_best_model(const hf_cache::hf_files & files,
                                          const std::string        & tag) {
     std::vector<std::string> tags;
@@ -653,7 +668,7 @@ static hf_cache::hf_file find_best_model(const hf_cache::hf_files & files,
     }
 
     for (const auto & t : tags) {
-        std::regex pattern(t + "[.-]", std::regex::icase);
+        std::regex pattern(regex_escape_literal(t) + "[.-]", std::regex::icase);
         for (const auto & f : files) {
             if (gguf_filename_is_model(f.path) &&
                 std::regex_search(f.path, pattern)) {
@@ -873,6 +888,34 @@ common_download_model_result common_download_model(const common_params_model  & 
     return result;
 }
 
+std::vector<std::string> common_cached_model_files(const std::string & hf_repo) {
+    std::vector<std::string> out;
+    if (hf_repo.empty()) {
+        return out;
+    }
+
+    common_params_model model;
+    model.hf_repo = hf_repo;
+
+    common_download_opts opts;
+    opts.offline = true; // cache only: get_hf_plan() resolves files without any network/download
+
+    // get_hf_plan() (via common_download_split_repo_tag) throws on a string that is not a
+    // "<user>/<model>[:quant]" repo. Such an input simply isn't a cached HF model, so report
+    // "not cached" rather than propagating the exception to CLI callers.
+    hf_plan plan;
+    try {
+        plan = get_hf_plan(model, opts, /* download_mmproj */ false, /* download_mtp */ false);
+    } catch (const std::exception &) {
+        return out;
+    }
+    out.reserve(plan.model_files.size());
+    for (const auto & f : plan.model_files) {
+        out.push_back(f.local_path.empty() ? f.final_path : f.local_path);
+    }
+    return out;
+}
+
 //
 // Docker registry functions
 //
@@ -996,11 +1039,28 @@ std::string common_docker_resolve_model(const std::string & docker) {
     }
 }
 
-std::vector<common_cached_model_info> common_list_cached_models() {
+std::vector<common_cached_model_info> common_list_cached_models(bool with_sizes) {
     std::unordered_set<std::string> seen;
     std::vector<common_cached_model_info> result;
 
     auto files = hf_cache::get_cached_files();
+
+    // optionally sum on-disk sizes per (repo, split-prefix) in a single pass, so a model's
+    // primary GGUF + its split shards are aggregated without re-walking the cache per model
+    std::map<std::pair<std::string, std::string>, uint64_t> size_by_group;
+    if (with_sizes) {
+        for (const auto & f : files) {
+            auto split = get_gguf_split_info(f.path);
+            if (split.prefix.empty()) {
+                continue; // not a GGUF file
+            }
+            std::error_code ec;
+            const auto sz = std::filesystem::file_size(f.local_path.empty() ? f.final_path : f.local_path, ec);
+            if (!ec) {
+                size_by_group[{f.repo_id, split.prefix}] += (uint64_t) sz;
+            }
+        }
+    }
 
     for (const auto & f : files) {
         auto split = get_gguf_split_info(f.path);
@@ -1010,7 +1070,14 @@ std::vector<common_cached_model_info> common_list_cached_models() {
             continue;
         }
         if (seen.insert(f.repo_id + ":" + split.tag).second) {
-            result.push_back({f.repo_id, split.tag});
+            common_cached_model_info info;
+            info.repo = f.repo_id;
+            info.tag  = split.tag;
+            if (with_sizes) {
+                const auto it = size_by_group.find({f.repo_id, split.prefix});
+                info.size = it != size_by_group.end() ? it->second : 0;
+            }
+            result.push_back(std::move(info));
         }
     }
 

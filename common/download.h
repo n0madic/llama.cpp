@@ -42,6 +42,7 @@ std::pair<std::string, std::string> common_download_split_repo_tag(const std::st
 struct common_cached_model_info {
     std::string repo;
     std::string tag;
+    uint64_t    size = 0; // on-disk size (bytes) of the model's GGUF file(s); 0 unless requested
     std::string to_string() const {
         return repo + ":" + tag;
     }
@@ -101,8 +102,14 @@ common_download_model_result common_download_model(
     const common_download_opts & opts = {}
 );
 
-// returns list of cached models
-std::vector<common_cached_model_info> common_list_cached_models();
+// returns list of cached models. When with_sizes is true, each entry's `size` is filled in with
+// the on-disk size of that model's GGUF file(s), summed during the same single cache enumeration.
+std::vector<common_cached_model_info> common_list_cached_models(bool with_sizes = false);
+
+// resolve which cached GGUF file(s) a HF repo (with optional :tag) maps to, applying the same
+// selection as common_download_model (quant preference Q4_K_M -> Q8_0 -> first, plus split shards)
+// but offline (cache only, no network, no download). Returns local paths, empty if not cached.
+std::vector<std::string> common_cached_model_files(const std::string & hf_repo);
 
 // download single file from url to local path
 // returns status code or -1 on error
