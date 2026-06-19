@@ -3,7 +3,6 @@
 #include "common.h"
 #include "preset.h"
 #include "download.h"
-#include "hf-cache.h"
 #include "http.h"
 #include "console.h"
 
@@ -1503,19 +1502,8 @@ int cmd_rm(int argc, char ** argv) {
     // case 2: a cached HF repo (always has a '/'). With a :tag remove only that quant's file(s)
     // and their blobs; without one drop the whole repo. A bare non-preset name hits the error below.
     if (repo.find('/') != std::string::npos) {
-        if (!tag_of(name).empty()) {
-            // a specific quant: delete only its file(s), leaving other quants and the mmproj intact
-            const auto files = common_cached_model_files(name);
-            if (!files.empty() && hf_cache::delete_cached_files(repo, files) > 0) {
-                printf("removed %s\n", name.c_str());
-                if (daemon_up) {
-                    reload_daemon_models(cfg);
-                }
-                return 0;
-            }
-        } else if (hf_cache::delete_cached_repo(repo)) {
-            // no tag: drop the whole repo
-            printf("removed %s\n", repo.c_str());
+        if (common_download_remove(name)) {
+            printf("removed %s\n", tag_of(name).empty() ? repo.c_str() : name.c_str());
             if (daemon_up) {
                 reload_daemon_models(cfg);
             }
